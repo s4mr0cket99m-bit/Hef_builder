@@ -3,8 +3,12 @@ name: Build Hailo HEF (MiniLM Reranker) — from Release asset
 on:
   workflow_dispatch:
     inputs:
+      release_tag:
+        description: "Release tag that contains the wheel (e.g., v1)"
+        required: true
+        default: "v1"
       asset_name:
-        description: "Exact filename of the Hailo DFC wheel attached to the latest Release"
+        description: "Exact wheel filename in that Release"
         required: true
         default: "hailo_dataflow_compiler-3.33.0-py3-none-linux_x86_64.whl"
       model_url:
@@ -30,31 +34,45 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install onnx numpy
 
-      # Fetch your Hailo DFC wheel from the repo's latest Release
-      - name: Download Hailo DFC wheel from latest Release
+      # --- Get the asset download URL from your Release (no YAML heredocs) ---
+      - name: Locate wheel asset in Release
+        id: find_asset
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const tag   = core.getInput('release_tag');
+            const name  = core.getInput('asset_name');
+            const {owner, repo} = context.repo;
+            const rel = await github.rest.repos.getReleaseByTag({ owner, repo, tag });
+            const asset = rel.data.assets.find(a => a.name === name);
+            core.info(`Assets in ${tag}: ${rel.data.assets.map(a=>a.name).join(', ')}`);
+            if (!asset) core.setFailed(`Asset not found: ${name}`);
+            core.setOutput('asset_url', asset.url);
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          REPO: ${{ github.repository }}
-          ASSET_NAME: ${{ github.event.inputs.asset_name }}
+          release_tag: ${{ github.event.inputs.release_tag }}
+          asset_name:  ${{ github.event.inputs.asset_name }}
+
+      - name: Download + install Hailo DFC wheel
+        env:
+          ASSET_URL: ${{ steps.find_asset.outputs.asset_url }}
+          GH_TOKEN:  ${{ secrets.GITHUB_TOKEN }}
         run: |
-          set -e
-          API="https://api.github.com/repos/$REPO/releases/latest"
-          JSON="$(curl -sSL -H "Authorization: Bearer $GITHUB_TOKEN" "$API")"
-          ASSET_URL=$(python - <<'PY'
-import os, sys, json
-j=json.loads(open(0).read())
-name=os.environ["ASSET_NAME"]
-for a in j.get("assets", []):
-    if a.get("name")==name:
-        print(a["url"])
-        break
-PY
-)
-          test -n "$ASSET_URL" || { echo "❌ Asset not found in latest Release: $ASSET_NAME" >&2; exit 1; }
           mkdir -p vendor
-          curl -sSL -H "Authorization: Bearer $GITHUB_TOKEN" -H "Accept: application/octet-stream" "$ASSET_URL" -o vendor/hailo_dfc.whl
+          curl -sSL -H "Authorization: Bearer ${GH_TOKEN}" -H "Accept: application/octet-stream" \
+               "${ASSET_URL}" -o vendor/hailo_dfc.whl
           ls -lh vendor/hailo_dfc.whl
           python -m pip install vendor/hailo_dfc.whl
+
+      - name: Verify Hailo SDK is present
+        run: |
+          which hailo || (echo "hailo CLI not on PATH" && exit 1)
+          hailo --version || true
+          python - <<'PY'
+          import importlib
+          m = importlib.import_module("hailo_sdk_client")
+          print("hailo_sdk_client OK:", m.__file__)
+          PY
 
       - name: Prepare workspace
         run: |
@@ -67,42 +85,37 @@ PY
           curl -L -o onnx/model.onnx "$MODEL_URL"
           ls -lh onnx/model.onnx
 
-      # Tiny synthetic calibration (no external downloads)
-      - name: Create tiny calibration set
+      - name: Create tiny calibration set (synthetic, fast)
         run: |
           python - <<'PY'
           import os, random, pathlib
           os.makedirs("calib", exist_ok=True)
-          queries = [
-            "genetic variant risk association","gene expression change","rsID clinical significance",
-            "allele frequency population study","odds ratio disease susceptibility",
-            "variant pathogenicity benign conflicting","GWAS replication meta-analysis",
-            "linkage disequilibrium haplotype","case control cohort study",
-            "functional annotation eQTL splicing","polygenic risk score","rare variant burden test",
-            "biomarker predictive value","effect size confidence interval","population stratification correction",
-            "imputation reference panel","heritability estimate","fine-mapping credible set",
-            "transcriptomic regulation","mendelian randomization causal inference"
-          ]
-          passages = [
-            "This study evaluates the association between a single nucleotide polymorphism and disease outcomes.",
-            "We report effect sizes, confidence intervals and p-values across multiple cohorts.",
-            "Functional annotation suggests potential impact on gene regulation and splicing.",
-            "Allele frequencies are compared among populations using public datasets.",
-            "Results include replication and meta-analysis statistics.",
-            "Clinical significance is uncertain with conflicting interpretations.",
-            "Pathway analysis indicates enrichment in immune-related processes.",
-            "LD with nearby variants may confound association signals.",
-            "eQTL analysis indicates tissue-specific effects.",
-            "Further validation is recommended before clinical interpretation."
-          ]
+          qs = ["genetic variant risk association","gene expression change","rsID clinical significance",
+                "allele frequency population study","odds ratio disease susceptibility",
+                "variant pathogenicity benign conflicting","GWAS replication meta-analysis",
+                "linkage disequilibrium haplotype","case control cohort study",
+                "functional annotation eQTL splicing","polygenic risk score","rare variant burden test",
+                "biomarker predictive value","effect size confidence interval","imputation reference panel",
+                "heritability estimate","fine-mapping credible set","transcriptomic regulation",
+                "mendelian randomization causal inference"]
+          ps = ["This study evaluates association between a SNP and outcomes.",
+                "We report effect sizes, confidence intervals and p-values across cohorts.",
+                "Functional annotation suggests potential impact on gene regulation and splicing.",
+                "Allele frequencies are compared among populations.",
+                "Replication and meta-analysis statistics provided.",
+                "Clinical significance uncertain with conflicting interpretations.",
+                "Pathway analysis suggests immune-related enrichment.",
+                "LD with nearby variants may confound signals.",
+                "eQTL indicates tissue-specific effects.",
+                "Further validation recommended before clinical interpretation."]
           for i in range(200):
             p = pathlib.Path(f"calib/sample_{i:04d}.txt")
-            q,a,b = random.choice(queries),random.choice(passages),random.choice(passages)
+            q,a,b = random.choice(qs),random.choice(ps),random.choice(ps)
             p.write_text(q+"\n"+a+"\n"+b+"\n", encoding="utf-8")
-          print("✅ Calibration folder ready: calib/")
+          print("Calibration folder ready.")
           PY
 
-      # DFC flow: parse -> optimize (quantize) -> compile
+      # ---- DFC flow: parse -> optimize -> compile ----
       - name: Parse ONNX -> HAR
         run: |
           hailo parser onnx onnx/model.onnx --har-path build/parsed.har --hw-arch hailo8
@@ -114,7 +127,7 @@ PY
           os.makedirs("build", exist_ok=True)
           arr = [np.random.randint(0,30000,(1,128),dtype=np.int32) for _ in range(64)]
           np.savez("build/calib_set.npz", *arr)
-          print("✅ Wrote build/calib_set.npz")
+          print("Wrote build/calib_set.npz")
           PY
 
       - name: Optimize (quantize) with calibration
@@ -128,7 +141,7 @@ PY
           r = ClientRunner(har="build/quantized.har")
           hef = r.compile()
           open("reranker.hef","wb").write(hef)
-          print("✅ HEF written: reranker.hef")
+          print("HEF written: reranker.hef")
           PY
 
       - name: Upload HEF artifact
