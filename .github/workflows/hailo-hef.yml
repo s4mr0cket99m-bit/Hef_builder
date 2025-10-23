@@ -6,6 +6,7 @@ on:
 jobs:
   build-hef:
     runs-on: ubuntu-latest
+
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
@@ -18,7 +19,6 @@ jobs:
       - name: Install Python deps
         run: |
           python -m pip install --upgrade pip
-          # IMPORTANT: it's "datasets" (plural), plus onnx for the IO-detect step
           python -m pip install "datasets==2.*" onnx
 
       - name: Prepare workspace
@@ -29,8 +29,7 @@ jobs:
       - name: Download ONNX model (Xenova/ms-marco-MiniLM-L-6-v2)
         run: |
           set -e
-          curl -L -o onnx/model.onnx \
-            "https://huggingface.co/Xenova/ms-marco-MiniLM-L-6-v2/resolve/main/onnx/model.onnx?download=true"
+          curl -L -o onnx/model.onnx "https://huggingface.co/Xenova/ms-marco-MiniLM-L-6-v2/resolve/main/onnx/model.onnx?download=true"
           ls -lh onnx/model.onnx
 
       - name: Create a tiny calibration set (MS MARCO triples small)
@@ -42,7 +41,12 @@ jobs:
           import os
           from datasets import load_dataset
           os.makedirs("calib", exist_ok=True)
-          docpairs = load_dataset("irds/msmarco-passage_train_triples-small", "docpairs")
+          # allow custom loader code for this dataset
+          docpairs = load_dataset(
+              "irds/msmarco-passage_train_triples-small",
+              "docpairs",
+              trust_remote_code=True
+          )
           for i, ex in enumerate(docpairs.select(range(150))):
               with open(f"calib/triple_{i:04d}.txt", "w") as f:
                   f.write(ex["query"].strip()+"\n")
@@ -57,7 +61,7 @@ jobs:
           model:
             path: /w/onnx/model.onnx
           parser:
-            nodes: []         # will auto-infer; we'll patch if it fails
+            nodes: []         # auto-infer; we’ll patch if it fails
           preprocessing:
             network_type: generic
           quantization:
@@ -115,4 +119,27 @@ jobs:
           cat zoo.yaml
           docker run --rm -v "$GITHUB_WORKSPACE":/w hailoai/hailo-model-zoo:latest \
             /bin/bash -lc '
-              set -
+              set -e
+              cd /w
+              echo "[1/2] Quantizing (retry)…"
+              hailo_model_zoo.py quantize --ckpt /w/onnx/model.onnx --yaml /w/zoo.yaml
+              echo "[2/2] Compiling (retry)…"
+              hailo_model_zoo.py compile  --ckpt /w/onnx/model.onnx --yaml /w/zoo.yaml --hw-arch hailo8
+              ls -1 *.hef || true
+            '
+
+      - name: Gather HEF
+        run: |
+          set -e
+          HEF="$(ls -1 *.hef | head -n1 || true)"
+          if [ -z "$HEF" ]; then
+            echo "No .hef produced. Open the logs; paste the last error to me and I'll patch the workflow." >&2
+            exit 1
+          fi
+          cp -v "$HEF" reranker.hef
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: hailo-hef
+          path: reranker.hef
