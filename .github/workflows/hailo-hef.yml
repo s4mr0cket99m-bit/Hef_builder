@@ -25,6 +25,7 @@ jobs:
       - name: Create a tiny calibration set (MS MARCO triples small)
         run: |
           set -e
+          pip install dataset
           python - <<'PY'
           import os, json
           from datasets import load_dataset
