@@ -34,8 +34,8 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install onnx numpy
 
-      # --- Get the asset download URL from your Release (no YAML heredocs) ---
-      - name: Locate wheel asset in Release
+      # Find the wheel in the chosen Release tag and install it
+      - name: Locate wheel in Release
         id: find_asset
         uses: actions/github-script@v7
         with:
@@ -45,15 +45,12 @@ jobs:
             const name  = core.getInput('asset_name');
             const {owner, repo} = context.repo;
             const rel = await github.rest.repos.getReleaseByTag({ owner, repo, tag });
-            const asset = rel.data.assets.find(a => a.name === name);
             core.info(`Assets in ${tag}: ${rel.data.assets.map(a=>a.name).join(', ')}`);
+            const asset = rel.data.assets.find(a => a.name === name);
             if (!asset) core.setFailed(`Asset not found: ${name}`);
             core.setOutput('asset_url', asset.url);
-        env:
-          release_tag: ${{ github.event.inputs.release_tag }}
-          asset_name:  ${{ github.event.inputs.asset_name }}
 
-      - name: Download + install Hailo DFC wheel
+      - name: Download + install Hailo Dataflow Compiler wheel
         env:
           ASSET_URL: ${{ steps.find_asset.outputs.asset_url }}
           GH_TOKEN:  ${{ secrets.GITHUB_TOKEN }}
@@ -64,7 +61,7 @@ jobs:
           ls -lh vendor/hailo_dfc.whl
           python -m pip install vendor/hailo_dfc.whl
 
-      - name: Verify Hailo SDK is present
+      - name: Verify Hailo SDK import/CLI
         run: |
           which hailo || (echo "hailo CLI not on PATH" && exit 1)
           hailo --version || true
@@ -100,9 +97,9 @@ jobs:
                 "mendelian randomization causal inference"]
           ps = ["This study evaluates association between a SNP and outcomes.",
                 "We report effect sizes, confidence intervals and p-values across cohorts.",
-                "Functional annotation suggests potential impact on gene regulation and splicing.",
+                "Functional annotation suggests impact on regulation/splicing.",
                 "Allele frequencies are compared among populations.",
-                "Replication and meta-analysis statistics provided.",
+                "Replication and meta-analysis statistics are provided.",
                 "Clinical significance uncertain with conflicting interpretations.",
                 "Pathway analysis suggests immune-related enrichment.",
                 "LD with nearby variants may confound signals.",
@@ -115,7 +112,7 @@ jobs:
           print("Calibration folder ready.")
           PY
 
-      # ---- DFC flow: parse -> optimize -> compile ----
+      # Parse -> Optimize -> Compile
       - name: Parse ONNX -> HAR
         run: |
           hailo parser onnx onnx/model.onnx --har-path build/parsed.har --hw-arch hailo8
