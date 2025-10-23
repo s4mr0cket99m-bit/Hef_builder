@@ -1,7 +1,7 @@
 name: Build Hailo HEF (MiniLM Reranker)
 
 on:
-  workflow_dispatch: {}   # run manually from Actions tab
+  workflow_dispatch: {}
 
 jobs:
   build-hef:
@@ -9,6 +9,17 @@ jobs:
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Python deps
+        run: |
+          python -m pip install --upgrade pip
+          # IMPORTANT: it's "datasets" (plural), plus onnx for the IO-detect step
+          python -m pip install "datasets==2.*" onnx
 
       - name: Prepare workspace
         run: |
@@ -19,29 +30,26 @@ jobs:
         run: |
           set -e
           curl -L -o onnx/model.onnx \
-            https://huggingface.co/Xenova/ms-marco-MiniLM-L-6-v2/resolve/main/onnx/model.onnx?download=true
+            "https://huggingface.co/Xenova/ms-marco-MiniLM-L-6-v2/resolve/main/onnx/model.onnx?download=true"
           ls -lh onnx/model.onnx
 
       - name: Create a tiny calibration set (MS MARCO triples small)
+        env:
+          HF_HUB_DISABLE_TELEMETRY: "1"
         run: |
           set -e
-          pip install dataset
           python - <<'PY'
-          import os, json
+          import os
           from datasets import load_dataset
           os.makedirs("calib", exist_ok=True)
-          ds = load_dataset("irds/msmarco-passage_train_triples-small", "docpairs")
-          # write 150 tiny text files with (query,docA,docB)
-          for i, ex in enumerate(ds.select(range(150))):
+          docpairs = load_dataset("irds/msmarco-passage_train_triples-small", "docpairs")
+          for i, ex in enumerate(docpairs.select(range(150))):
               with open(f"calib/triple_{i:04d}.txt", "w") as f:
                   f.write(ex["query"].strip()+"\n")
                   f.write(ex["doc_a"].strip()+"\n")
                   f.write(ex["doc_b"].strip()+"\n")
           print("Calibration folder ready: calib/")
           PY
-        env:
-          HF_HUB_DISABLE_TELEMETRY: "1"
-        shell: bash
 
       - name: Write zoo.yaml (generic first attempt)
         run: |
@@ -49,7 +57,7 @@ jobs:
           model:
             path: /w/onnx/model.onnx
           parser:
-            nodes: []         # we'll let the tool infer; if it fails we auto-patch below
+            nodes: []         # will auto-infer; we'll patch if it fails
           preprocessing:
             network_type: generic
           quantization:
@@ -91,7 +99,6 @@ jobs:
           outs = [o.name for o in m.graph.output]
           print("INPUTS:", ins)
           print("OUTPUTS:", outs)
-          # Write a patched zoo.yaml with explicit nodes
           with open("zoo.yaml","w") as f:
               f.write("model:\n  path: /w/onnx/model.onnx\n")
               f.write("parser:\n  nodes:\n")
@@ -108,27 +115,4 @@ jobs:
           cat zoo.yaml
           docker run --rm -v "$GITHUB_WORKSPACE":/w hailoai/hailo-model-zoo:latest \
             /bin/bash -lc '
-              set -e
-              cd /w
-              echo "[1/2] Quantizing (retry)…"
-              hailo_model_zoo.py quantize --ckpt /w/onnx/model.onnx --yaml /w/zoo.yaml
-              echo "[2/2] Compiling (retry)…"
-              hailo_model_zoo.py compile  --ckpt /w/onnx/model.onnx --yaml /w/zoo.yaml --hw-arch hailo8
-              ls -1 *.hef || true
-            '
-
-      - name: Gather HEF
-        run: |
-          set -e
-          HEF="$(ls -1 *.hef | head -n1 || true)"
-          if [ -z "$HEF" ]; then
-            echo "No .hef produced. Open the logs; if IO names look odd, paste them to me and I'll hard-code them." >&2
-            exit 1
-          fi
-          cp -v "$HEF" reranker.hef
-
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: hailo-hef
-          path: reranker.hef
+              set -
