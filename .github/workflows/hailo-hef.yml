@@ -1,0 +1,133 @@
+name: Build Hailo HEF (MiniLM Reranker)
+
+on:
+  workflow_dispatch: {}   # run manually from Actions tab
+
+jobs:
+  build-hef:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Prepare workspace
+        run: |
+          set -e
+          mkdir -p onnx calib
+
+      - name: Download ONNX model (Xenova/ms-marco-MiniLM-L-6-v2)
+        run: |
+          set -e
+          curl -L -o onnx/model.onnx \
+            https://huggingface.co/Xenova/ms-marco-MiniLM-L-6-v2/resolve/main/onnx/model.onnx?download=true
+          ls -lh onnx/model.onnx
+
+      - name: Create a tiny calibration set (MS MARCO triples small)
+        run: |
+          set -e
+          python - <<'PY'
+          import os, json
+          from datasets import load_dataset
+          os.makedirs("calib", exist_ok=True)
+          ds = load_dataset("irds/msmarco-passage_train_triples-small", "docpairs")
+          # write 150 tiny text files with (query,docA,docB)
+          for i, ex in enumerate(ds.select(range(150))):
+              with open(f"calib/triple_{i:04d}.txt", "w") as f:
+                  f.write(ex["query"].strip()+"\n")
+                  f.write(ex["doc_a"].strip()+"\n")
+                  f.write(ex["doc_b"].strip()+"\n")
+          print("Calibration folder ready: calib/")
+          PY
+        env:
+          HF_HUB_DISABLE_TELEMETRY: "1"
+        shell: bash
+
+      - name: Write zoo.yaml (generic first attempt)
+        run: |
+          cat > zoo.yaml <<'YML'
+          model:
+            path: /w/onnx/model.onnx
+          parser:
+            nodes: []         # we'll let the tool infer; if it fails we auto-patch below
+          preprocessing:
+            network_type: generic
+          quantization:
+            calib_set: /w/calib
+            images_dir: /w/calib
+          hnp:
+            target: hailo8
+          postprocessing:
+            network_type: generic
+          YML
+          cat zoo.yaml
+
+      - name: Pull Hailo Model Zoo Docker
+        run: docker pull hailoai/hailo-model-zoo:latest
+
+      - name: Quantize + Compile (attempt 1)
+        id: compile1
+        continue-on-error: true
+        run: |
+          docker run --rm -v "$GITHUB_WORKSPACE":/w hailoai/hailo-model-zoo:latest \
+            /bin/bash -lc '
+              set -e
+              cd /w
+              echo "[1/2] Quantizing…"
+              hailo_model_zoo.py quantize --ckpt /w/onnx/model.onnx --yaml /w/zoo.yaml
+              echo "[2/2] Compiling…"
+              hailo_model_zoo.py compile  --ckpt /w/onnx/model.onnx --yaml /w/zoo.yaml --hw-arch hailo8
+              ls -1 *.hef || true
+            '
+
+      - name: If attempt 1 failed, auto-detect IO names and retry
+        if: steps.compile1.outcome == 'failure'
+        run: |
+          set -e
+          python - <<'PY'
+          import onnx
+          m = onnx.load("onnx/model.onnx")
+          ins = [i.name for i in m.graph.input]
+          outs = [o.name for o in m.graph.output]
+          print("INPUTS:", ins)
+          print("OUTPUTS:", outs)
+          # Write a patched zoo.yaml with explicit nodes
+          with open("zoo.yaml","w") as f:
+              f.write("model:\n  path: /w/onnx/model.onnx\n")
+              f.write("parser:\n  nodes:\n")
+              for i in ins:
+                  f.write(f"    - input: {i}\n")
+              for o in outs:
+                  f.write(f"    - output: {o}\n")
+              f.write("preprocessing:\n  network_type: generic\n")
+              f.write("quantization:\n  calib_set: /w/calib\n  images_dir: /w/calib\n")
+              f.write("hnp:\n  target: hailo8\n")
+              f.write("postprocessing:\n  network_type: generic\n")
+          print("Patched zoo.yaml with explicit IO.")
+          PY
+          cat zoo.yaml
+          docker run --rm -v "$GITHUB_WORKSPACE":/w hailoai/hailo-model-zoo:latest \
+            /bin/bash -lc '
+              set -e
+              cd /w
+              echo "[1/2] Quantizing (retry)…"
+              hailo_model_zoo.py quantize --ckpt /w/onnx/model.onnx --yaml /w/zoo.yaml
+              echo "[2/2] Compiling (retry)…"
+              hailo_model_zoo.py compile  --ckpt /w/onnx/model.onnx --yaml /w/zoo.yaml --hw-arch hailo8
+              ls -1 *.hef || true
+            '
+
+      - name: Gather HEF
+        run: |
+          set -e
+          HEF="$(ls -1 *.hef | head -n1 || true)"
+          if [ -z "$HEF" ]; then
+            echo "No .hef produced. Open the logs; if IO names look odd, paste them to me and I'll hard-code them." >&2
+            exit 1
+          fi
+          cp -v "$HEF" reranker.hef
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: hailo-hef
+          path: reranker.hef
