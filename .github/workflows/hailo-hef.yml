@@ -1,14 +1,23 @@
-name: Build Hailo HEF (MiniLM Reranker)
+name: Build Hailo HEF (MiniLM Reranker) — from Release asset
 
 on:
-  workflow_dispatch: {}
+  workflow_dispatch:
+    inputs:
+      asset_name:
+        description: "Exact filename of the Hailo DFC wheel attached to the latest Release"
+        required: true
+        default: "hailo_dataflow_compiler-3.33.0-py3-none-linux_x86_64.whl"
+      model_url:
+        description: "ONNX model URL to compile"
+        required: true
+        default: "https://huggingface.co/Xenova/ms-marco-MiniLM-L-6-v2/resolve/main/onnx/model.onnx?download=true"
 
 jobs:
   build-hef:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout repo
+      - name: Checkout
         uses: actions/checkout@v4
 
       - name: Setup Python
@@ -16,145 +25,113 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Install Python deps
+      - name: Install base deps
         run: |
           python -m pip install --upgrade pip
-          # onnx is used later to auto-detect input/output names if needed
-          python -m pip install onnx
+          python -m pip install onnx numpy
+
+      # Fetch your Hailo DFC wheel from the repo's latest Release
+      - name: Download Hailo DFC wheel from latest Release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          ASSET_NAME: ${{ github.event.inputs.asset_name }}
+        run: |
+          set -e
+          API="https://api.github.com/repos/$REPO/releases/latest"
+          JSON="$(curl -sSL -H "Authorization: Bearer $GITHUB_TOKEN" "$API")"
+          ASSET_URL=$(python - <<'PY'
+import os, sys, json
+j=json.loads(open(0).read())
+name=os.environ["ASSET_NAME"]
+for a in j.get("assets", []):
+    if a.get("name")==name:
+        print(a["url"])
+        break
+PY
+)
+          test -n "$ASSET_URL" || { echo "❌ Asset not found in latest Release: $ASSET_NAME" >&2; exit 1; }
+          mkdir -p vendor
+          curl -sSL -H "Authorization: Bearer $GITHUB_TOKEN" -H "Accept: application/octet-stream" "$ASSET_URL" -o vendor/hailo_dfc.whl
+          ls -lh vendor/hailo_dfc.whl
+          python -m pip install vendor/hailo_dfc.whl
 
       - name: Prepare workspace
         run: |
-          set -e
-          mkdir -p onnx calib
+          mkdir -p onnx calib build
 
-      - name: Download ONNX model (Xenova/ms-marco-MiniLM-L-6-v2)
+      - name: Download ONNX model
+        env:
+          MODEL_URL: ${{ github.event.inputs.model_url }}
         run: |
-          set -e
-          curl -L -o onnx/model.onnx "https://huggingface.co/Xenova/ms-marco-MiniLM-L-6-v2/resolve/main/onnx/model.onnx?download=true"
+          curl -L -o onnx/model.onnx "$MODEL_URL"
           ls -lh onnx/model.onnx
 
-      # --- NEW: zero-download, instant calibration set (200 tiny text files) ---
-      - name: Create a tiny calibration set (no external downloads)
+      # Tiny synthetic calibration (no external downloads)
+      - name: Create tiny calibration set
         run: |
-          set -e
           python - <<'PY'
-          import os, random
+          import os, random, pathlib
           os.makedirs("calib", exist_ok=True)
           queries = [
-            "genetic variant risk association", "gene expression change", "rsID clinical significance",
-            "allele frequency population study", "odds ratio disease susceptibility",
-            "variant pathogenicity benign conflicting", "GWAS replication meta-analysis",
-            "linkage disequilibrium haplotype", "case control cohort study",
-            "functional annotation eQTL splicing", "polygenic risk score PRS", "rare variant burden test",
-            "biomarker predictive value", "effect size confidence interval", "population stratification correction",
-            "imputation reference panel", "heritability estimate", "fine-mapping credible set", "transcriptomic regulation",
-            "mendelian randomization causal inference"
+            "genetic variant risk association","gene expression change","rsID clinical significance",
+            "allele frequency population study","odds ratio disease susceptibility",
+            "variant pathogenicity benign conflicting","GWAS replication meta-analysis",
+            "linkage disequilibrium haplotype","case control cohort study",
+            "functional annotation eQTL splicing","polygenic risk score","rare variant burden test",
+            "biomarker predictive value","effect size confidence interval","population stratification correction",
+            "imputation reference panel","heritability estimate","fine-mapping credible set",
+            "transcriptomic regulation","mendelian randomization causal inference"
           ]
           passages = [
             "This study evaluates the association between a single nucleotide polymorphism and disease outcomes.",
             "We report effect sizes, confidence intervals and p-values across multiple cohorts.",
             "Functional annotation suggests potential impact on gene regulation and splicing.",
-            "Allele frequencies are compared among populations using publicly available datasets.",
-            "Results include replication in independent cohorts and meta-analysis statistics.",
-            "The clinical significance is uncertain with conflicting interpretations in literature.",
+            "Allele frequencies are compared among populations using public datasets.",
+            "Results include replication and meta-analysis statistics.",
+            "Clinical significance is uncertain with conflicting interpretations.",
             "Pathway analysis indicates enrichment in immune-related processes.",
-            "Linkage disequilibrium with nearby variants may confound association signals.",
-            "Expression quantitative trait loci analysis indicates tissue-specific effects.",
+            "LD with nearby variants may confound association signals.",
+            "eQTL analysis indicates tissue-specific effects.",
             "Further validation is recommended before clinical interpretation."
           ]
           for i in range(200):
-            q = random.choice(queries)
-            a = random.choice(passages)
-            b = random.choice(passages)
-            with open(f"calib/sample_{i:04d}.txt", "w") as f:
-              f.write(q + "\n" + a + "\n" + b + "\n")
-          print("Calibration folder ready: calib/ (200 synthetic text files)")
+            p = pathlib.Path(f"calib/sample_{i:04d}.txt")
+            q,a,b = random.choice(queries),random.choice(passages),random.choice(passages)
+            p.write_text(q+"\n"+a+"\n"+b+"\n", encoding="utf-8")
+          print("✅ Calibration folder ready: calib/")
           PY
 
-      - name: Write zoo.yaml (generic first attempt)
+      # DFC flow: parse -> optimize (quantize) -> compile
+      - name: Parse ONNX -> HAR
         run: |
-          cat > zoo.yaml <<'YML'
-          model:
-            path: /w/onnx/model.onnx
-          parser:
-            nodes: []         # auto-infer; we’ll patch if it fails
-          preprocessing:
-            network_type: generic
-          quantization:
-            calib_set: /w/calib
-            images_dir: /w/calib
-          hnp:
-            target: hailo8
-          postprocessing:
-            network_type: generic
-          YML
-          cat zoo.yaml
+          hailo parser onnx onnx/model.onnx --har-path build/parsed.har --hw-arch hailo8
 
-      - name: Pull Hailo Model Zoo Docker
-        run: docker pull hailoai/hailo-model-zoo:latest
-
-      - name: Quantize + Compile (attempt 1)
-        id: compile1
-        continue-on-error: true
+      - name: Build numpy calibration archive
         run: |
-          docker run --rm -v "$GITHUB_WORKSPACE":/w hailoai/hailo-model-zoo:latest \
-            /bin/bash -lc '
-              set -e
-              cd /w
-              echo "[1/2] Quantizing…"
-              hailo_model_zoo.py quantize --ckpt /w/onnx/model.onnx --yaml /w/zoo.yaml
-              echo "[2/2] Compiling…"
-              hailo_model_zoo.py compile  --ckpt /w/onnx/model.onnx --yaml /w/zoo.yaml --hw-arch hailo8
-              ls -1 *.hef || true
-            '
-
-      - name: If attempt 1 failed, auto-detect IO names and retry
-        if: steps.compile1.outcome == 'failure'
-        run: |
-          set -e
           python - <<'PY'
-          import onnx
-          m = onnx.load("onnx/model.onnx")
-          ins = [i.name for i in m.graph.input]
-          outs = [o.name for o in m.graph.output]
-          print("INPUTS:", ins)
-          print("OUTPUTS:", outs)
-          with open("zoo.yaml","w") as f:
-            f.write("model:\n  path: /w/onnx/model.onnx\n")
-            f.write("parser:\n  nodes:\n")
-            for i in ins:
-              f.write(f"    - input: {i}\n")
-            for o in outs:
-              f.write(f"    - output: {o}\n")
-            f.write("preprocessing:\n  network_type: generic\n")
-            f.write("quantization:\n  calib_set: /w/calib\n  images_dir: /w/calib\n")
-            f.write("hnp:\n  target: hailo8\n")
-            f.write("postprocessing:\n  network_type: generic\n")
-          print("Patched zoo.yaml with explicit IO.")
+          import numpy as np, os
+          os.makedirs("build", exist_ok=True)
+          arr = [np.random.randint(0,30000,(1,128),dtype=np.int32) for _ in range(64)]
+          np.savez("build/calib_set.npz", *arr)
+          print("✅ Wrote build/calib_set.npz")
           PY
-          cat zoo.yaml
-          docker run --rm -v "$GITHUB_WORKSPACE":/w hailoai/hailo-model-zoo:latest \
-            /bin/bash -lc '
-              set -e
-              cd /w
-              echo "[1/2] Quantizing (retry)…"
-              hailo_model_zoo.py quantize --ckpt /w/onnx/model.onnx --yaml /w/zoo.yaml
-              echo "[2/2] Compiling (retry)…"
-              hailo_model_zoo.py compile  --ckpt /w/onnx/model.onnx --yaml /w/zoo.yaml --hw-arch hailo8
-              ls -1 *.hef || true
-            '
 
-      - name: Gather HEF
+      - name: Optimize (quantize) with calibration
         run: |
-          set -e
-          HEF="$(ls -1 *.hef | head -n1 || true)"
-          if [ -z "$HEF" ]; then
-            echo "No .hef produced. Please copy the last error lines and I’ll patch the workflow." >&2
-            exit 1
-          fi
-          cp -v "$HEF" reranker.hef
+          hailo optimize build/parsed.har --calib-set-path build/calib_set.npz --hw-arch hailo8 --har-path build/quantized.har
 
-      - name: Upload artifact
+      - name: Compile HAR -> HEF
+        run: |
+          python - <<'PY'
+          from hailo_sdk_client import ClientRunner
+          r = ClientRunner(har="build/quantized.har")
+          hef = r.compile()
+          open("reranker.hef","wb").write(hef)
+          print("✅ HEF written: reranker.hef")
+          PY
+
+      - name: Upload HEF artifact
         uses: actions/upload-artifact@v4
         with:
           name: hailo-hef
