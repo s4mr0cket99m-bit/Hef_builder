@@ -19,8 +19,8 @@ jobs:
       - name: Install Python deps
         run: |
           python -m pip install --upgrade pip
-          # NOTE: need both 'datasets' and 'ir_datasets' (this fixes your current error) + onnx for IO detection
-          python -m pip install "datasets==2.*" ir_datasets onnx
+          # onnx is used later to auto-detect input/output names if needed
+          python -m pip install onnx
 
       - name: Prepare workspace
         run: |
@@ -33,27 +33,42 @@ jobs:
           curl -L -o onnx/model.onnx "https://huggingface.co/Xenova/ms-marco-MiniLM-L-6-v2/resolve/main/onnx/model.onnx?download=true"
           ls -lh onnx/model.onnx
 
-      - name: Create a tiny calibration set (MS MARCO triples small)
-        env:
-          HF_HUB_DISABLE_TELEMETRY: "1"
+      # --- NEW: zero-download, instant calibration set (200 tiny text files) ---
+      - name: Create a tiny calibration set (no external downloads)
         run: |
           set -e
           python - <<'PY'
-          import os
-          from datasets import load_dataset
+          import os, random
           os.makedirs("calib", exist_ok=True)
-          # allow custom loader code and use the IRDS-backed small triples split
-          docpairs = load_dataset(
-              "irds/msmarco-passage_train_triples-small",
-              "docpairs",
-              trust_remote_code=True
-          )
-          for i, ex in enumerate(docpairs.select(range(150))):
-              with open(f"calib/triple_{i:04d}.txt", "w") as f:
-                  f.write(ex["query"].strip()+"\n")
-                  f.write(ex["doc_a"].strip()+"\n")
-                  f.write(ex["doc_b"].strip()+"\n")
-          print("Calibration folder ready: calib/")
+          queries = [
+            "genetic variant risk association", "gene expression change", "rsID clinical significance",
+            "allele frequency population study", "odds ratio disease susceptibility",
+            "variant pathogenicity benign conflicting", "GWAS replication meta-analysis",
+            "linkage disequilibrium haplotype", "case control cohort study",
+            "functional annotation eQTL splicing", "polygenic risk score PRS", "rare variant burden test",
+            "biomarker predictive value", "effect size confidence interval", "population stratification correction",
+            "imputation reference panel", "heritability estimate", "fine-mapping credible set", "transcriptomic regulation",
+            "mendelian randomization causal inference"
+          ]
+          passages = [
+            "This study evaluates the association between a single nucleotide polymorphism and disease outcomes.",
+            "We report effect sizes, confidence intervals and p-values across multiple cohorts.",
+            "Functional annotation suggests potential impact on gene regulation and splicing.",
+            "Allele frequencies are compared among populations using publicly available datasets.",
+            "Results include replication in independent cohorts and meta-analysis statistics.",
+            "The clinical significance is uncertain with conflicting interpretations in literature.",
+            "Pathway analysis indicates enrichment in immune-related processes.",
+            "Linkage disequilibrium with nearby variants may confound association signals.",
+            "Expression quantitative trait loci analysis indicates tissue-specific effects.",
+            "Further validation is recommended before clinical interpretation."
+          ]
+          for i in range(200):
+            q = random.choice(queries)
+            a = random.choice(passages)
+            b = random.choice(passages)
+            with open(f"calib/sample_{i:04d}.txt", "w") as f:
+              f.write(q + "\n" + a + "\n" + b + "\n")
+          print("Calibration folder ready: calib/ (200 synthetic text files)")
           PY
 
       - name: Write zoo.yaml (generic first attempt)
@@ -62,7 +77,7 @@ jobs:
           model:
             path: /w/onnx/model.onnx
           parser:
-            nodes: []         # auto-infer; we'll patch if it fails
+            nodes: []         # auto-infer; we’ll patch if it fails
           preprocessing:
             network_type: generic
           quantization:
@@ -134,7 +149,7 @@ jobs:
           set -e
           HEF="$(ls -1 *.hef | head -n1 || true)"
           if [ -z "$HEF" ]; then
-            echo "No .hef produced. Paste the last error logs to me and I’ll patch the workflow." >&2
+            echo "No .hef produced. Please copy the last error lines and I’ll patch the workflow." >&2
             exit 1
           fi
           cp -v "$HEF" reranker.hef
