@@ -19,7 +19,8 @@ jobs:
       - name: Install Python deps
         run: |
           python -m pip install --upgrade pip
-          python -m pip install "datasets==2.*" onnx
+          # NOTE: need both 'datasets' and 'ir_datasets' (this fixes your current error) + onnx for IO detection
+          python -m pip install "datasets==2.*" ir_datasets onnx
 
       - name: Prepare workspace
         run: |
@@ -41,7 +42,7 @@ jobs:
           import os
           from datasets import load_dataset
           os.makedirs("calib", exist_ok=True)
-          # allow custom loader code for this dataset
+          # allow custom loader code and use the IRDS-backed small triples split
           docpairs = load_dataset(
               "irds/msmarco-passage_train_triples-small",
               "docpairs",
@@ -61,7 +62,7 @@ jobs:
           model:
             path: /w/onnx/model.onnx
           parser:
-            nodes: []         # auto-infer; we’ll patch if it fails
+            nodes: []         # auto-infer; we'll patch if it fails
           preprocessing:
             network_type: generic
           quantization:
@@ -104,16 +105,16 @@ jobs:
           print("INPUTS:", ins)
           print("OUTPUTS:", outs)
           with open("zoo.yaml","w") as f:
-              f.write("model:\n  path: /w/onnx/model.onnx\n")
-              f.write("parser:\n  nodes:\n")
-              for i in ins:
-                  f.write(f"    - input: {i}\n")
-              for o in outs:
-                  f.write(f"    - output: {o}\n")
-              f.write("preprocessing:\n  network_type: generic\n")
-              f.write("quantization:\n  calib_set: /w/calib\n  images_dir: /w/calib\n")
-              f.write("hnp:\n  target: hailo8\n")
-              f.write("postprocessing:\n  network_type: generic\n")
+            f.write("model:\n  path: /w/onnx/model.onnx\n")
+            f.write("parser:\n  nodes:\n")
+            for i in ins:
+              f.write(f"    - input: {i}\n")
+            for o in outs:
+              f.write(f"    - output: {o}\n")
+            f.write("preprocessing:\n  network_type: generic\n")
+            f.write("quantization:\n  calib_set: /w/calib\n  images_dir: /w/calib\n")
+            f.write("hnp:\n  target: hailo8\n")
+            f.write("postprocessing:\n  network_type: generic\n")
           print("Patched zoo.yaml with explicit IO.")
           PY
           cat zoo.yaml
@@ -133,7 +134,7 @@ jobs:
           set -e
           HEF="$(ls -1 *.hef | head -n1 || true)"
           if [ -z "$HEF" ]; then
-            echo "No .hef produced. Open the logs; paste the last error to me and I'll patch the workflow." >&2
+            echo "No .hef produced. Paste the last error logs to me and I’ll patch the workflow." >&2
             exit 1
           fi
           cp -v "$HEF" reranker.hef
