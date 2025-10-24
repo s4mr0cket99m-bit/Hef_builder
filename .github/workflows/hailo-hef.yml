@@ -1,128 +1,135 @@
-name: Build Hailo HEF (MiniLM Reranker) — direct wheel
+name: Build Hailo HEF (MiniLM Reranker)
 
 on:
-  workflow_dispatch:
-    inputs:
-      wheel_url:
-        description: "Direct URL to the Hailo Dataflow Compiler wheel"
-        required: true
-        default: "https://github.com/s4mr0cket99m-bit/Hef_builder/releases/download/v1/hailo_dataflow_compiler-3.33.0-py3-none-linux_x86_64.whl"
-      model_url:
-        description: "ONNX model URL to compile"
-        required: true
-        default: "https://huggingface.co/Xenova/ms-marco-MiniLM-L-6-v2/resolve/main/onnx/model.onnx?download=true"
+  workflow_dispatch: {}  # allow manual trigger from Actions tab
 
 jobs:
   build-hef:
     runs-on: ubuntu-latest
 
     steps:
-    - name: Checkout
-      uses: actions/checkout@v4
+      - name: Checkout repository
+        uses: actions/checkout@v4
 
-    - name: Setup Python
-      uses: actions/setup-python@v5
-      with:
-        python-version: "3.10"  # 3.11 can be used too
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
 
-    - name: Install Python & system deps
-      run: |
-        python -m pip install --upgrade pip wheel
-        python -m pip install onnx numpy
-        sudo apt-get update
-        sudo apt-get install -y graphviz libgraphviz-dev pkg-config python3-dev
+      - name: Install Python dependencies
+      # We need datasets for the calibration set and onnx for input/output detection
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install "datasets==2.*" onnx
 
-    # Download your DFC wheel (don’t rename; keep server filename).
-    - name: Download & install Hailo DFC wheel
-      env:
-        WHEEL_URL: ${{ github.event.inputs.wheel_url }}
-        GH_TOKEN:  ${{ secrets.GITHUB_TOKEN }}
-      run: |
-        set -e
-        mkdir -p vendor
-        cd vendor
-        # -L follow redirects, -J keep server filename, -O write to file
-        curl -fL -J -O -H "Authorization: Bearer ${GH_TOKEN}" "$WHEEL_URL"
-        ls -l
-        python -m pip install ./*.whl
+      - name: Prepare workspace directories
+        run: |
+          mkdir -p onnx calib
 
-    # Download the ONNX model
-    - name: Download ONNX
-      env:
-        MODEL_URL: ${{ github.event.inputs.model_url }}
-      run: |
-        set -e
-        mkdir -p onnx
-        curl -fL -o onnx/model.onnx "$MODEL_URL"
-        ls -lh onnx/model.onnx
+      - name: Download ONNX model (Xenova/ms-marco-MiniLM-L-6-v2)
+        run: |
+          curl -L -o onnx/model.onnx \
+            "https://huggingface.co/Xenova/ms-marco-MiniLM-L-6-v2/resolve/main/onnx/model.onnx?download=true"
+          ls -lh onnx/model.onnx
 
-    # Determine input names and generate --input-sizes parameters
-    - name: Generate input sizes
-      id: inputsizes
-      run: |
-        python - <<'PY'
-        import onnx, json, os
-        model = onnx.load("onnx/model.onnx")
-        # Collect input names that are not initializers
-        init_names = {init.name for init in model.graph.initializer}
-        names = []
-        for inp in model.graph.input:
-          if inp.name not in init_names:
-            names.append(inp.name)
-        # Build flags for static shape [1,128] for each input
-        sizes_str = ",".join(f"{n}=1x128" for n in names)
-        print("sizes=" + sizes_str)
-        # Expose for later steps
-        with open(os.environ["GITHUB_OUTPUT"], "a") as f:
-          f.write(f"sizes={sizes_str}\n")
-        PY
+      - name: Create tiny calibration set (200 AG News samples)
+        env:
+          HF_HUB_DISABLE_TELEMETRY: "1"
+        run: |
+          python - <<'PY'
+          import os
+          from datasets import load_dataset
+          os.makedirs("calib", exist_ok=True)
+          # Use AG News for a small calibration set (avoids heavy IRDS dependencies)
+          ds = load_dataset("ag_news", split="train[:200]")
+          for i, ex in enumerate(ds):
+              text = ex["text"].replace("\n", " ")[:1000]
+              with open(f"calib/sample_{i:04d}.txt", "w") as f:
+                  f.write(text)
+          print("Calibration folder ready:", len(os.listdir("calib")), "files")
+          PY
 
-    # Parse with static shapes
-    - name: Parse ONNX -> HAR
-      run: |
-        set -e
-        SIZES="${{ steps.inputsizes.outputs.sizes }}"
-        echo "Using input sizes: $SIZES"
-        hailo parser onnx onnx/model.onnx \
-          --input-sizes "$SIZES" \
-          --har-path build/parsed.har \
-          --hw-arch hailo8
+      - name: Write Hailo YAML configuration
+        run: |
+          cat > zoo.yaml <<'YML'
+          model:
+            path: /w/onnx/model.onnx
+          parser:
+            nodes: []         # Let the tool infer input/output names
+          preprocessing:
+            network_type: generic
+          quantization:
+            calib_set: /w/calib
+            images_dir: /w/calib
+          hnp:
+            target: hailo8
+          postprocessing:
+            network_type: generic
+          YML
+          cat zoo.yaml
 
-    # Prepare dummy calibration NPZ (64 samples of shape [1,128] int32)
-    - name: Create calibration set
-      run: |
-        python - <<'PY'
-        import numpy as np, os
-        os.makedirs("build", exist_ok=True)
-        arr = [np.random.randint(0, 30000, size=(1,128), dtype=np.int32) for _ in range(64)]
-        np.savez("build/calib_set.npz", *arr)
-        PY
+      - name: Pull Hailo Model Zoo Docker image
+        run: docker pull hailoai/hailo-model-zoo:latest
 
-    # Quantize/optimize
-    - name: Optimize model (quantize)
-      run: |
-        set -e
-        hailo optimize build/parsed.har \
-          --calib-set-path build/calib_set.npz \
-          --hw-arch hailo8 \
-          --har-path build/quantized.har
+      - name: Quantize and compile (first attempt)
+        id: compile1
+        continue-on-error: true
+        run: |
+          docker run --rm -v "$GITHUB_WORKSPACE":/w hailoai/hailo-model-zoo:latest \
+            /bin/bash -lc '
+              set -e
+              cd /w
+              echo "[1/2] Quantizing..."
+              hailo_model_zoo.py quantize --ckpt /w/onnx/model.onnx --yaml /w/zoo.yaml
+              echo "[2/2] Compiling..."
+              hailo_model_zoo.py compile --ckpt /w/onnx/model.onnx --yaml /w/zoo.yaml --hw-arch hailo8
+              ls -1 *.hef || true
+            '
 
-    # Compile to HEF using Python API
-    - name: Compile HAR to HEF
-      run: |
-        set -e
-        python - <<'PY'
-        from hailo_sdk_client import ClientRunner
-        r = ClientRunner(har="build/quantized.har")
-        hef = r.compile()
-        with open("reranker.hef","wb") as f:
-          f.write(hef)
-        print("HEF generated:", len(hef), "bytes")
-        PY
+      - name: Auto-detect IO names and retry (if needed)
+        if: steps.compile1.outcome == 'failure'
+        run: |
+          python - <<'PY'
+          import onnx
+          m = onnx.load("onnx/model.onnx")
+          inputs = [i.name for i in m.graph.input]
+          outputs = [o.name for o in m.graph.output]
+          with open("zoo.yaml", "w") as f:
+              f.write("model:\n  path: /w/onnx/model.onnx\n")
+              f.write("parser:\n  nodes:\n")
+              for name in inputs:
+                  f.write(f"    - input: {name}\n")
+              for name in outputs:
+                  f.write(f"    - output: {name}\n")
+              f.write("preprocessing:\n  network_type: generic\n")
+              f.write("quantization:\n  calib_set: /w/calib\n  images_dir: /w/calib\n")
+              f.write("hnp:\n  target: hailo8\n")
+              f.write("postprocessing:\n  network_type: generic\n")
+          print("Patched zoo.yaml with explicit IO names:", inputs, outputs)
+          PY
+          cat zoo.yaml
+          docker run --rm -v "$GITHUB_WORKSPACE":/w hailoai/hailo-model-zoo:latest \
+            /bin/bash -lc '
+              set -e
+              cd /w
+              echo "[Retry] Quantizing..."
+              hailo_model_zoo.py quantize --ckpt /w/onnx/model.onnx --yaml /w/zoo.yaml
+              echo "[Retry] Compiling..."
+              hailo_model_zoo.py compile --ckpt /w/onnx/model.onnx --yaml /w/zoo.yaml --hw-arch hailo8
+              ls -1 *.hef || true
+            '
 
-    # Upload the resulting HEF
-    - name: Upload HEF
-      uses: actions/upload-artifact@v4
-      with:
-        name: hailo-hef
-        path: reranker.hef
+      - name: Collect HEF file
+        run: |
+          HEF="$(ls -1 *.hef | head -n1 || true)"
+          if [ -z "$HEF" ]; then
+            echo "No .hef was produced. Check the logs and model compatibility."
+            exit 1
+          fi
+          cp "$HEF" reranker.hef
+
+      - name: Upload compiled HEF
+        uses: actions/upload-artifact@v4
+        with:
+          name: hailo-hef
+          path: reranker.hef
