@@ -6,6 +6,7 @@ on:
 jobs:
   build-hef:
     runs-on: ubuntu-latest
+    timeout-minutes: 90
 
     steps:
       - name: Checkout repository
@@ -18,15 +19,18 @@ jobs:
 
       - name: Install Python dependencies
         run: |
+          set -euo pipefail
           python -m pip install --upgrade pip
           python -m pip install "datasets==2.*" onnx numpy
 
       - name: Prepare workspace
         run: |
-          mkdir -p onnx calib build
+          set -euo pipefail
+          mkdir -p onnx calib build deps
 
       - name: Download ONNX model (Xenova/ms-marco-MiniLM-L-6-v2)
         run: |
+          set -euo pipefail
           curl -L -o onnx/model.onnx \
             "https://huggingface.co/Xenova/ms-marco-MiniLM-L-6-v2/resolve/main/onnx/model.onnx?download=true"
           ls -lh onnx/model.onnx
@@ -35,6 +39,7 @@ jobs:
         env:
           HF_HUB_DISABLE_TELEMETRY: "1"
         run: |
+          set -euo pipefail
           python - <<'PY'
           import os
           from datasets import load_dataset
@@ -47,13 +52,14 @@ jobs:
           print("Calibration folder ready:", len(os.listdir("calib")), "files")
           PY
 
-      - name: Write Hailo YAML configuration (generic; IO auto-infer)
+      - name: Write Hailo YAML (generic IO; will patch if needed)
         run: |
+          set -euo pipefail
           cat > zoo.yaml <<'YML'
           model:
             path: /w/onnx/model.onnx
           parser:
-            nodes: []   # tool will infer; we patch if needed
+            nodes: []   # auto-infer, we patch if compile fails
           preprocessing:
             network_type: generic
           quantization:
@@ -66,37 +72,41 @@ jobs:
           YML
           cat zoo.yaml
 
-      # ---------- TRY 1: Docker Hub ----------
-      - name: Try to pull Hailo Model Zoo (Docker Hub)
-        id: pull_hub
+      # --------- TRY DOCKER IMAGES (Hub then GHCR, multiple tags) ----------
+      - name: Try to pull Hailo Model Zoo images
+        id: pull_try
         continue-on-error: true
         run: |
-          docker pull hailoai/hailo-model-zoo:latest
-
-      # ---------- TRY 2: GHCR (if Hub failed) ----------
-      - name: Try to pull Hailo Model Zoo (GHCR)
-        id: pull_ghcr
-        if: steps.pull_hub.outcome == 'failure'
-        continue-on-error: true
-        run: |
-          docker pull ghcr.io/hailo-ai/hailo-model-zoo:latest
-
-      # ---------- PATH A: Use Model Zoo in Docker if either image pulled ----------
-      - name: Set DOCKER_IMAGE env
-        if: steps.pull_hub.outcome == 'success' || steps.pull_ghcr.outcome == 'success'
-        run: |
-          if [ "${{ steps.pull_hub.outcome }}" = "success" ]; then
-            echo "DOCKER_IMAGE=hailoai/hailo-model-zoo:latest" >> $GITHUB_ENV
-          else
-            echo "DOCKER_IMAGE=ghcr.io/hailo-ai/hailo-model-zoo:latest" >> $GITHUB_ENV
+          set -euo pipefail
+          TAGS="latest 2.15.0 2.14.0 2.13.0"
+          IMAGES=(
+            "hailoai/hailo-model-zoo"
+            "ghcr.io/hailo-ai/hailo-model-zoo"
+          )
+          pulled=""
+          for img in "${IMAGES[@]}"; do
+            for tag in $TAGS; do
+              echo "Attempting: docker pull ${img}:${tag}"
+              if docker pull "${img}:${tag}"; then
+                echo "DOCKER_IMAGE=${img}:${tag}" >> "$GITHUB_ENV"
+                pulled="yes"
+                break 2
+              fi
+            done
+          done
+          if [ -z "$pulled" ]; then
+            echo "DOCKER_IMAGE=" >> "$GITHUB_ENV"
+            echo "No public Model-Zoo image could be pulled. Will fall back to DFC wheel if present."
+            exit 1
           fi
 
       - name: Quantize + Compile via Model Zoo (Docker)
-        if: steps.pull_hub.outcome == 'success' || steps.pull_ghcr.outcome == 'success'
         id: compile_docker
+        if: env.DOCKER_IMAGE != ''
         continue-on-error: true
         run: |
-          docker run --rm -v "$GITHUB_WORKSPACE":/w $DOCKER_IMAGE \
+          set -euo pipefail
+          docker run --rm -v "$GITHUB_WORKSPACE":/w "${DOCKER_IMAGE}" \
             /bin/bash -lc '
               set -e
               cd /w
@@ -107,74 +117,105 @@ jobs:
               ls -1 *.hef || true
             '
 
-      # ---------- PATH B: No Docker available -> use DFC wheel directly ----------
-      # Put your DFC wheel into the repo at: deps/hailo_dataflow_compiler-*.whl
-      - name: Install Hailo DFC wheel (fallback path)
-        if: steps.pull_hub.outcome == 'failure' && steps.pull_ghcr.outcome == 'failure'
+      - name: Auto-detect IO names and retry (Docker path)
+        if: env.DOCKER_IMAGE != '' && steps.compile_docker.outcome == 'failure'
         run: |
-          set -e
-          WHL="$(ls -1 deps/hailo_dataflow_compiler-*.whl | head -n1 || true)"
+          set -euo pipefail
+          python - <<'PY'
+          import onnx
+          m = onnx.load("onnx/model.onnx")
+          ins  = [i.name for i in m.graph.input]
+          outs = [o.name for o in m.graph.output]
+          print("Inputs:", ins)
+          print("Outputs:", outs)
+          with open("zoo.yaml","w") as f:
+            f.write("model:\n  path: /w/onnx/model.onnx\n")
+            f.write("parser:\n  nodes:\n")
+            for n in ins:  f.write(f"    - input: {n}\n")
+            for n in outs: f.write(f"    - output: {n}\n")
+            f.write("preprocessing:\n  network_type: generic\n")
+            f.write("quantization:\n  calib_set: /w/calib\n  images_dir: /w/calib\n")
+            f.write("hnp:\n  target: hailo8\n")
+            f.write("postprocessing:\n  network_type: generic\n")
+          PY
+          cat zoo.yaml
+          docker run --rm -v "$GITHUB_WORKSPACE":/w "${DOCKER_IMAGE}" \
+            /bin/bash -lc '
+              set -e
+              cd /w
+              echo "[Retry] Quantizing…"
+              hailo_model_zoo.py quantize --ckpt /w/onnx/model.onnx --yaml /w/zoo.yaml
+              echo "[Retry] Compiling…"
+              hailo_model_zoo.py compile  --ckpt /w/onnx/model.onnx --yaml /w/zoo.yaml --hw-arch hailo8
+              ls -1 *.hef || true
+            '
+
+      # --------- FALLBACK: USE YOUR DFC WHEEL (no Docker) ----------
+      # Put your wheel in the repo at: deps/hailo_dataflow_compiler-*.whl
+      - name: Install Hailo DFC wheel (fallback)
+        id: install_dfc
+        if: env.DOCKER_IMAGE == ''
+        run: |
+          set -euo pipefail
+          WHL="$(ls -1 deps/hailo_dataflow_compiler-*.whl 2>/dev/null | head -n1 || true)"
           if [ -z "$WHL" ]; then
-            echo "Hailo Docker images unavailable, and no DFC wheel found under deps/. Please add the DFC wheel." >&2
+            echo "::error::Hailo Docker images not available AND no DFC wheel found under deps/."
+            echo "ACTION: Upload your wheel (e.g., hailo_dataflow_compiler-3.33.0-py3-none-linux_x86_64.whl) to deps/ and re-run."
             exit 2
           fi
           python -m pip install "$WHL"
           hailo --version || true
-          hailo --help    || true
 
       - name: Parse ONNX → HAR (DFC CLI)
-        if: steps.pull_hub.outcome == 'failure' && steps.pull_ghcr.outcome == 'failure'
         id: parse_har
+        if: env.DOCKER_IMAGE == '' && steps.install_dfc.outcome == 'success'
         continue-on-error: true
         run: |
-          set -e
-          # NOTE: Do NOT pass --input-sizes (caused your previous error)
+          set -euo pipefail
+          # IMPORTANT: do NOT pass --input-sizes (your previous error came from that)
           hailo parser onnx onnx/model.onnx --har-path build/parsed.har --hw-arch hailo8
           ls -lh build/parsed.har
 
-      - name: Auto-detect IO & retry parse if needed
-        if: steps.pull_hub.outcome == 'failure' && steps.pull_ghcr.outcome == 'failure' && steps.parse_har.outcome == 'failure'
+      - name: Auto-detect IO & retry parse (DFC CLI)
+        if: env.DOCKER_IMAGE == '' && steps.install_dfc.outcome == 'success' && steps.parse_har.outcome == 'failure'
         run: |
+          set -euo pipefail
           python - <<'PY'
-          import onnx, json, sys
+          import onnx
           m = onnx.load("onnx/model.onnx")
-          ins = [i.name for i in m.graph.input]
-          outs = [o.name for o in m.graph.output]
-          print("Inputs:", ins)
-          print("Outputs:", outs)
-          # If your DFC requires a params CSV or explicit nodes, we just log here.
-          # If parse failed again later, copy these names into a model script or CSV.
+          print("Inputs:", [i.name for i in m.graph.input])
+          print("Outputs:", [o.name for o in m.graph.output])
           PY
-          # Try again (some DFC builds accept --start-nodes/--end-nodes; we only display names for manual tune)
-          hailo parser onnx onnx/model.onnx --har-path build/parsed.har --hw-arch hailo8 || exit 1
+          # Try parse again with same minimal flags (most DFC builds accept auto inference)
+          hailo parser onnx onnx/model.onnx --har-path build/parsed.har --hw-arch hailo8
 
       - name: Optimize (quantize) HAR (DFC CLI)
-        if: steps.pull_hub.outcome == 'failure' && steps.pull_ghcr.outcome == 'failure'
         id: optimize_har
+        if: env.DOCKER_IMAGE == '' && steps.install_dfc.outcome == 'success'
         continue-on-error: true
         run: |
-          set -e
-          # Generic optimize; exact flags vary between DFC builds. This is the common form.
-          # If your DFC prints usage differences, the logs will show the expected flag names.
-          hailo optimize --har build/parsed.har --calib-set calib --output-har build/optimized.har
-          ls -lh build/optimized.har
+          set -euo pipefail
+          hailo optimize --har build/parsed.har --calib-set calib --output-har build/optimized.har || true
+          if [ -f build/optimized.har ]; then
+            echo "HAR_OUT=build/optimized.har" >> $GITHUB_ENV
+          else
+            echo "HAR_OUT=build/parsed.har" >> $GITHUB_ENV
+          fi
 
       - name: Compile HEF (DFC CLI)
-        if: steps.pull_hub.outcome == 'failure' && steps.pull_ghcr.outcome == 'failure'
+        if: env.DOCKER_IMAGE == '' && steps.install_dfc.outcome == 'success'
         run: |
-          set -e
-          # If optimize produced no file (older DFCs), compile the parsed HAR directly.
-          SRC_HAR="build/optimized.har"
-          [ -f "$SRC_HAR" ] || SRC_HAR="build/parsed.har"
-          hailo compiler --hef-path reranker.hef "$SRC_HAR"
+          set -euo pipefail
+          hailo compiler --hef-path reranker.hef "${HAR_OUT}"
           ls -lh reranker.hef
 
-      # ---------- Collect HEF (works for either path) ----------
+      # --------- COLLECT OUTPUT ----------
       - name: Collect HEF
         run: |
-          HEF="$(ls -1 *.hef | head -n1 || true)"
+          set -euo pipefail
+          HEF="$(ls -1 *.hef 2>/dev/null | head -n1 || true)"
           if [ -z "$HEF" ]; then
-            echo "No .hef produced. Please open the Quantize/Compile logs above and share the last ~30 lines." >&2
+            echo "::error::No .hef produced. Open the last ~40 lines of the Quantize/Compile step above and share them."
             exit 1
           fi
           cp -v "$HEF" reranker.hef
