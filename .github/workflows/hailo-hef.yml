@@ -25,12 +25,18 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Install base deps
+      - name: Install base Python deps
         run: |
           python -m pip install --upgrade pip wheel
           python -m pip install onnx numpy
 
-      # ---- DOWNLOAD WHEEL WITHOUT RENAMING (fixes 'Invalid wheel filename') ----
+      # Install system dependencies needed to build pygraphviz from source
+      - name: Install system packages for graphviz (pygraphviz dependency)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y graphviz libgraphviz-dev pkg-config python3-dev
+
+      # ---- DOWNLOAD WHEEL WITHOUT RENAMING ----
       - name: Fetch + install Hailo DFC wheel (direct URL)
         env:
           WHEEL_URL: ${{ github.event.inputs.wheel_url }}
@@ -39,16 +45,13 @@ jobs:
           set -e
           mkdir -p vendor
           cd vendor
-          # -L follow redirects, -J keep server's filename, -O write to file
           curl -fL -J -O -H "Authorization: Bearer ${GH_TOKEN}" "${WHEEL_URL}"
           ls -lh
-          # Install the wheel using its original filename
           python -m pip install ./*.whl
 
       - name: Verify Hailo SDK import/CLI
         run: |
           set -e
-          # CLI may or may not be installed; don't fail if missing
           if command -v hailo >/dev/null 2>&1; then
             echo "hailo CLI found:"; hailo --version || true
           else
@@ -110,7 +113,7 @@ jobs:
           set -e
           if ! command -v hailo >/dev/null 2>&1; then
             echo "ERROR: 'hailo' CLI not found. Your wheel may not include the CLI subcommands."
-            echo "If this fails, tell me and I’ll switch the workflow to the Python API for parse/opt."
+            echo "Tell your assistant if you see this and they’ll switch to the Python API for parse/opt."
             exit 1
           fi
           hailo parser onnx onnx/model.onnx --har-path build/parsed.har --hw-arch hailo8
@@ -131,14 +134,15 @@ jobs:
           set -e
           hailo optimize build/parsed.har --calib-set-path build/calib_set.npz --hw-arch hailo8 --har-path build/quantized.har
 
-      - name: Compile HAR -> HEF (Python API)
+      - name: Compile HAR -> HEF
         run: |
           set -e
           python - <<'PY'
           from hailo_sdk_client import ClientRunner
           r = ClientRunner(har="build/quantized.har")
           hef = r.compile()
-          open("reranker.hef","wb").write(hef)
+          with open("reranker.hef","wb") as f:
+            f.write(hef)
           print("HEF written: reranker.hef")
           PY
 
