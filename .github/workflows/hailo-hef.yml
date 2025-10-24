@@ -1,16 +1,7 @@
-name: Build Hailo HEF (MiniLM Reranker)
+name: Build Hailo HEF (DFC only)
 
 on:
-  workflow_dispatch:
-    inputs:
-      release_tag:
-        description: "Release tag that contains the DFC wheel (e.g. dfc-1). Leave blank to use latest."
-        required: false
-        default: ""
-      asset_name:
-        description: "Exact wheel filename (e.g. hailo_dataflow_compiler-3.33.0-py3-none-linux_x86_64.whl). Strongly recommended."
-        required: false
-        default: ""
+  workflow_dispatch: {}   # Manual run from Actions tab
 
 jobs:
   build-hef:
@@ -18,7 +9,7 @@ jobs:
     timeout-minutes: 90
 
     steps:
-      - name: Checkout repo
+      - name: Checkout repository
         uses: actions/checkout@v4
 
       - name: Set up Python
@@ -26,153 +17,121 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Install Python deps
+      - name: Install base Python deps
         run: |
+          set -euo pipefail
           python -m pip install --upgrade pip
-          python -m pip install "datasets==2.*" onnx numpy
+          pip install onnx numpy "datasets==2.*"
 
-      - name: Prep workspace
+      - name: Prepare workspace
         run: |
-          mkdir -p onnx calib build deps
+          set -euo pipefail
+          mkdir -p onnx calib build
 
-      - name: Download ONNX model
+      # --------- Download DFC wheel from your release (public URL first, API fallback) ----------
+      - name: Fetch Hailo Dataflow Compiler wheel (dfc-1)
+        env:
+          WHEEL: hailo_dataflow_compiler-3.33.0-py3-none-linux_x86_64.whl
+          TAG: dfc-1
         run: |
+          set -euo pipefail
+          echo "Repo: ${GITHUB_REPOSITORY}"
+          URL="https://github.com/${GITHUB_REPOSITORY}/releases/download/${TAG}/${WHEEL}"
+          echo "Trying public URL: $URL"
+          if curl -fL "$URL" -o "$WHEEL"; then
+            echo "Downloaded via public URL."
+          else
+            echo "Public URL failed (private repo or permissions). Using API fallback…"
+            API="https://api.github.com/repos/${GITHUB_REPOSITORY}/releases/tags/${TAG}"
+            curl -sS -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+                 -H "Accept: application/vnd.github+json" \
+                 "$API" > release.json
+            python - <<'PY'
+            import json, sys, os
+            data = json.load(open("release.json"))
+            want = os.environ["WHEEL"]
+            m = next((a for a in data.get("assets", []) if a.get("name")==want), None)
+            if not m:
+              print("::error:: DFC wheel not found in release assets.")
+              print("Available assets:", [a.get("name") for a in data.get("assets",[])])
+              sys.exit(2)
+            open("asset_id.txt","w").write(str(m["id"]))
+            open("asset_name.txt","w").write(m["name"])
+            PY
+            ASSET_ID=$(cat asset_id.txt)
+            ASSET_NAME=$(cat asset_name.txt)
+            curl -fL -o "$ASSET_NAME" \
+                 -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+                 -H "Accept: application/octet-stream" \
+                 "https://api.github.com/repos/${GITHUB_REPOSITORY}/releases/assets/${ASSET_ID}"
+            mv "$ASSET_NAME" "$WHEEL"
+          fi
+          ls -lh "$WHEEL"
+
+      - name: Install Hailo Dataflow Compiler
+        run: |
+          set -euo pipefail
+          pip install "./hailo_dataflow_compiler-3.33.0-py3-none-linux_x86_64.whl"
+          echo "DFC version:"
+          hailo --version || true
+          hailo --help    >/dev/null 2>&1 || true
+
+      # --------- Bring an ONNX model (you said none is in the repo) ----------
+      - name: Download ONNX model (Xenova/ms-marco-MiniLM-L-6-v2)
+        run: |
+          set -euo pipefail
           curl -L -o onnx/model.onnx \
             "https://huggingface.co/Xenova/ms-marco-MiniLM-L-6-v2/resolve/main/onnx/model.onnx?download=true"
           ls -lh onnx/model.onnx
 
-      - name: Create tiny calibration set (AG News, 200)
+      # --------- Small, fast calibration set ----------
+      - name: Create calibration set (AG News, 200)
         env:
           HF_HUB_DISABLE_TELEMETRY: "1"
         run: |
+          set -euo pipefail
           python - <<'PY'
           import os
           from datasets import load_dataset
           os.makedirs("calib", exist_ok=True)
           ds = load_dataset("ag_news", split="train[:200]")
           for i, ex in enumerate(ds):
-              txt = ex["text"].replace("\n"," ")[:1000]
+              text = ex["text"].replace("\n"," ")[:1000]
               with open(f"calib/sample_{i:04d}.txt","w") as f:
-                  f.write(txt)
-          print("Calibration folder:", len(os.listdir("calib")), "files")
+                  f.write(text)
+          print("Calibration files:", len(os.listdir("calib")))
           PY
 
-      - name: Write Hailo YAML
-        run: |
-          cat > zoo.yaml <<'YML'
-          model:
-            path: /w/onnx/model.onnx
-          parser:
-            nodes: []     # infer; we'll patch if needed
-          preprocessing:
-            network_type: generic
-          quantization:
-            calib_set: /w/calib
-            images_dir: /w/calib
-          hnp:
-            target: hailo8
-          postprocessing:
-            network_type: generic
-          YML
-
-      # ---------- Try Model-Zoo Docker (Hub → GHCR) ----------
-      - name: Try Model-Zoo Docker
-        id: pull_try
+      # --------- Parse → Optimize (best effort) → Compile ----------
+      - name: Parse ONNX → HAR (DFC CLI)
+        id: parsehar
         continue-on-error: true
         run: |
-          set -e
-          for img in hailoai/hailo-model-zoo ghcr.io/hailo-ai/hailo-model-zoo; do
-            for tag in latest 2.15.0 2.14.0 2.13.0; do
-              echo "docker pull $img:$tag"
-              if docker pull "$img:$tag"; then
-                echo "DOCKER_IMAGE=$img:$tag" >> $GITHUB_ENV
-                exit 0
-              fi
-            done
-          done
-          exit 1
+          set -euo pipefail
+          hailo parser onnx onnx/model.onnx --har-path build/parsed.har --hw-arch hailo8
+          ls -lh build/parsed.har
 
-      - name: Quantize + Compile via Model Zoo (Docker)
-        id: compile_docker
-        if: steps.pull_try.outcome == 'success'
+      - name: Optimize (quantize) HAR if possible
+        id: optimize
         continue-on-error: true
         run: |
-          docker run --rm -v "$GITHUB_WORKSPACE":/w "$DOCKER_IMAGE" \
-            /bin/bash -lc '
-              set -e
-              cd /w
-              echo "[1/2] Quantizing..."
-              hailo_model_zoo.py quantize --ckpt /w/onnx/model.onnx --yaml /w/zoo.yaml
-              echo "[2/2] Compiling..."
-              hailo_model_zoo.py compile --ckpt /w/onnx/model.onnx --yaml /w/zoo.yaml --hw-arch hailo8
-              ls -1 *.hef || true
-            '
-
-      - name: Auto-detect IO names and retry (Docker)
-        if: steps.pull_try.outcome == 'success' && steps.compile_docker.outcome == 'failure'
-        run: |
-          python - <<'PY'
-          import onnx
-          m = onnx.load("onnx/model.onnx")
-          ins  = [i.name for i in m.graph.input]
-          outs = [o.name for o in m.graph.output]
-          with open("zoo.yaml","w") as f:
-            f.write("model:\n  path: /w/onnx/model.onnx\nparser:\n  nodes:\n")
-            for n in ins:  f.write(f"    - input: {n}\n")
-            for n in outs: f.write(f"    - output: {n}\n")
-            f.write("preprocessing:\n  network_type: generic\nquantization:\n  calib_set: /w/calib\n  images_dir: /w/calib\nhnp:\n  target: hailo8\npostprocessing:\n  network_type: generic\n")
-          PY
-          docker run --rm -v "$GITHUB_WORKSPACE":/w "$DOCKER_IMAGE" \
-            /bin/bash -lc '
-              set -e
-              cd /w
-              hailo_model_zoo.py quantize --ckpt /w/onnx/model.onnx --yaml /w/zoo.yaml
-              hailo_model_zoo.py compile  --ckpt /w/onnx/model.onnx --yaml /w/zoo.yaml --hw-arch hailo8
-              ls -1 *.hef || true
-            '
-
-      # ---------- Fallback: fetch your DFC wheel from a Release ----------
-      - name: Download DFC wheel from Release (uses exact filename)
-        if: steps.pull_try.outcome == 'failure'
-        env:
-          GH_REPO:  ${{ github.repository }}
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          REL_TAG:  ${{ github.event.inputs.release_tag }}
-          ASSET:    ${{ github.event.inputs.asset_name }}
-        run: |
-          set -e
-          if [ -n "$REL_TAG" ]; then
-            API_URL="https://api.github.com/repos/$GH_REPO/releases/tags/$REL_TAG"
+          set -euo pipefail
+          hailo optimize --har build/parsed.har --calib-set calib --output-har build/optimized.har || true
+          if [ -f build/optimized.har ]; then
+            echo "HAR_OUT=build/optimized.har" >> "$GITHUB_ENV"
           else
-            API_URL="https://api.github.com/repos/$GH_REPO/releases/latest"
+            echo "HAR_OUT=build/parsed.har" >> "$GITHUB_ENV"
           fi
-          JSON=$(curl -sS -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" "$API_URL")
-          echo "$JSON" > release.json
+          echo "Using HAR_OUT=$HAR_OUT"
 
-          python - <<'PY'
-          import json, os, sys
-          data = json.load(open("release.json"))
-          assets = data.get("assets", [])
-          want = os.environ.get("ASSET","").strip()
-          if want:
-            m = next((a for a in assets if a.get("name","")==want), None)
-            if not m:
-              print("::error::Could not find the asset named:", want)
-              print("Assets available:", [a.get('name') for a in assets]); sys.exit(2)
-          else:
-            # Fall back to the first asset that looks like a DFC wheel
-            m = next((a for a in assets if a.get("name","").startswith("hailo_dataflow_compiler-") and a.get("name","").endswith(".whl")), None)
-            if not m:
-              print("::error::No DFC wheel found. Please provide 'asset_name' when starting the workflow.")
-              print("Assets available:", [a.get('name') for a in assets]); sys.exit(2)
-          open("asset_id.txt","w").write(str(m["id"]))
-          open("asset_name.txt","w").write(m["name"])
-          PY
+      - name: Compile HEF
+        run: |
+          set -euo pipefail
+          hailo compiler --hef-path reranker.hef "$HAR_OUT"
+          ls -lh reranker.hef
 
-          ASSET_ID=$(cat asset_id.txt)
-          ASSET_NAME=$(cat asset_name.txt)
-          echo "Downloading asset: $ASSET_NAME (id=$ASSET_ID)"
-          curl -L -o "deps/$ASSET_NAME" \
-               -H "Authorization: Bearer $GH_TOKEN" \
-               -H "Accept: application/octet-stream" \
-               "https://api.github.com/repos/$GH_REPO/releases/assets/${
+      - name: Upload HEF artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: hailo-hef
+          path: reranker.hef
