@@ -1,16 +1,12 @@
-name: Build Hailo HEF (MiniLM Reranker) — from Release asset
+name: Build Hailo HEF (MiniLM Reranker) — direct URL
 
 on:
   workflow_dispatch:
     inputs:
-      release_tag:
-        description: "Release tag that contains the wheel (e.g., v1)"
+      wheel_url:
+        description: "Direct URL to the Hailo Dataflow Compiler wheel"
         required: true
-        default: "v1"
-      asset_name:
-        description: "Exact wheel filename in that Release"
-        required: true
-        default: "hailo_dataflow_compiler-3.33.0-py3-none-linux_x86_64.whl"
+        default: "https://github.com/s4mr0cket99m-bit/Hef_builder/releases/download/v1/hailo_dataflow_compiler-3.33.0-py3-none-linux_x86_64.whl"
       model_url:
         description: "ONNX model URL to compile"
         required: true
@@ -34,36 +30,23 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install onnx numpy
 
-      # Find the wheel in the chosen Release tag and install it
-      - name: Locate wheel in Release
-        id: find_asset
-        uses: actions/github-script@v7
-        with:
-          github-token: ${{ secrets.GITHUB_TOKEN }}
-          script: |
-            const tag   = core.getInput('release_tag');
-            const name  = core.getInput('asset_name');
-            const {owner, repo} = context.repo;
-            const rel = await github.rest.repos.getReleaseByTag({ owner, repo, tag });
-            core.info(`Assets in ${tag}: ${rel.data.assets.map(a=>a.name).join(', ')}`);
-            const asset = rel.data.assets.find(a => a.name === name);
-            if (!asset) core.setFailed(`Asset not found: ${name}`);
-            core.setOutput('asset_url', asset.url);
-
-      - name: Download + install Hailo Dataflow Compiler wheel
+      # --- download and install your Hailo DFC wheel from the given URL ---
+      - name: Fetch + install Hailo DFC wheel (direct URL)
         env:
-          ASSET_URL: ${{ steps.find_asset.outputs.asset_url }}
+          WHEEL_URL: ${{ github.event.inputs.wheel_url }}
           GH_TOKEN:  ${{ secrets.GITHUB_TOKEN }}
         run: |
+          set -e
           mkdir -p vendor
-          curl -sSL -H "Authorization: Bearer ${GH_TOKEN}" -H "Accept: application/octet-stream" \
-               "${ASSET_URL}" -o vendor/hailo_dfc.whl
+          # Use token header so this works for private repos too; safe for public.
+          curl -fL -H "Authorization: Bearer ${GH_TOKEN}" \
+               -o vendor/hailo_dfc.whl "${WHEEL_URL}"
           ls -lh vendor/hailo_dfc.whl
           python -m pip install vendor/hailo_dfc.whl
 
       - name: Verify Hailo SDK import/CLI
         run: |
-          which hailo || (echo "hailo CLI not on PATH" && exit 1)
+          which hailo || echo "NOTE: 'hailo' CLI not found on PATH (some wheel builds install SDK modules only)."
           hailo --version || true
           python - <<'PY'
           import importlib
@@ -79,7 +62,7 @@ jobs:
         env:
           MODEL_URL: ${{ github.event.inputs.model_url }}
         run: |
-          curl -L -o onnx/model.onnx "$MODEL_URL"
+          curl -fL -o onnx/model.onnx "$MODEL_URL"
           ls -lh onnx/model.onnx
 
       - name: Create tiny calibration set (synthetic, fast)
@@ -112,7 +95,7 @@ jobs:
           print("Calibration folder ready.")
           PY
 
-      # Parse -> Optimize -> Compile
+      # ---- DFC flow: parse -> optimize -> compile ----
       - name: Parse ONNX -> HAR
         run: |
           hailo parser onnx onnx/model.onnx --har-path build/parsed.har --hw-arch hailo8
