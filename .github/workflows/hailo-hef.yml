@@ -1,137 +1,60 @@
-name: Build Hailo HEF (DFC only)
-
+name: Hailo DistilGPT2 Compilation
 on:
-  workflow_dispatch: {}   # Manual run from Actions tab
-
+  workflow_dispatch:
 jobs:
-  build-hef:
+  compile_model:
     runs-on: ubuntu-latest
-    timeout-minutes: 90
-
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v3
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
+      - name: Set up Python 3.8
+        uses: actions/setup-python@v4
         with:
-          python-version: "3.11"
+          python-version: '3.8'
 
-      - name: Install base Python deps
+      - name: Install dependencies
         run: |
-          set -euo pipefail
           python -m pip install --upgrade pip
-          pip install onnx numpy "datasets==2.*"
+          pip install torch transformers onnx numpy
 
-      - name: Prepare workspace
+      - name: Download and convert DistilGPT2 to ONNX
         run: |
-          set -euo pipefail
-          mkdir -p onnx calib build
+          python - << 'EOF'
+          import torch
+          from transformers import AutoModelForCausalLM
+          model = AutoModelForCausalLM.from_pretrained("distilgpt2")
+          model.eval()
+          dummy_input = torch.randint(0, 50257, (1, 128), dtype=torch.long)
+          torch.onnx.export(
+              model, dummy_input, "distilgpt2.onnx",
+              input_names=["input_ids"], output_names=["logits"],
+              opset_version=12
+          )
+          EOF
 
-      # --------- Download DFC wheel from your release (public URL first, API fallback) ----------
-      - name: Fetch Hailo Dataflow Compiler wheel (dfc-1)
-        env:
-          WHEEL: hailo_dataflow_compiler-3.33.0-py3-none-linux_x86_64.whl
-          TAG: dfc-1
+      - name: Generate calibration data
         run: |
-          set -euo pipefail
-          echo "Repo: ${GITHUB_REPOSITORY}"
-          URL="https://github.com/${GITHUB_REPOSITORY}/releases/download/${TAG}/${WHEEL}"
-          echo "Trying public URL: $URL"
-          if curl -fL "$URL" -o "$WHEEL"; then
-            echo "Downloaded via public URL."
-          else
-            echo "Public URL failed (private repo or permissions). Using API fallback…"
-            API="https://api.github.com/repos/${GITHUB_REPOSITORY}/releases/tags/${TAG}"
-            curl -sS -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
-                 -H "Accept: application/vnd.github+json" \
-                 "$API" > release.json
-            python - <<'PY'
-            import json, sys, os
-            data = json.load(open("release.json"))
-            want = os.environ["WHEEL"]
-            m = next((a for a in data.get("assets", []) if a.get("name")==want), None)
-            if not m:
-              print("::error:: DFC wheel not found in release assets.")
-              print("Available assets:", [a.get("name") for a in data.get("assets",[])])
-              sys.exit(2)
-            open("asset_id.txt","w").write(str(m["id"]))
-            open("asset_name.txt","w").write(m["name"])
-            PY
-            ASSET_ID=$(cat asset_id.txt)
-            ASSET_NAME=$(cat asset_name.txt)
-            curl -fL -o "$ASSET_NAME" \
-                 -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
-                 -H "Accept: application/octet-stream" \
-                 "https://api.github.com/repos/${GITHUB_REPOSITORY}/releases/assets/${ASSET_ID}"
-            mv "$ASSET_NAME" "$WHEEL"
-          fi
-          ls -lh "$WHEEL"
+          python - << 'EOF'
+          import numpy as np
+          # Synthetic calibration data: shape (10, 128), values in [0, 50256]
+          calib_data = np.random.randint(0, 50257, size=(10, 128), dtype=np.int32)
+          np.save("calib_set.npy", calib_data)
+          EOF
 
       - name: Install Hailo Dataflow Compiler
-        run: |
-          set -euo pipefail
-          pip install "./hailo_dataflow_compiler-3.33.0-py3-none-linux_x86_64.whl"
-          echo "DFC version:"
-          hailo --version || true
-          hailo --help    >/dev/null 2>&1 || true
+        run: pip install https://github.com/s4mr0cket99m-bit/Hef_builder/releases/download/dfc-1/hailo_dataflow_compiler-3.33.0-py3-none-linux_x86_64.whl
 
-      # --------- Bring an ONNX model (you said none is in the repo) ----------
-      - name: Download ONNX model (Xenova/ms-marco-MiniLM-L-6-v2)
-        run: |
-          set -euo pipefail
-          curl -L -o onnx/model.onnx \
-            "https://huggingface.co/Xenova/ms-marco-MiniLM-L-6-v2/resolve/main/onnx/model.onnx?download=true"
-          ls -lh onnx/model.onnx
+      - name: Parse ONNX model with Hailo DFC
+        run: hailo parser onnx distilgpt2.onnx --net-name distilgpt2 --har-path distilgpt2.har
 
-      # --------- Small, fast calibration set ----------
-      - name: Create calibration set (AG News, 200)
-        env:
-          HF_HUB_DISABLE_TELEMETRY: "1"
-        run: |
-          set -euo pipefail
-          python - <<'PY'
-          import os
-          from datasets import load_dataset
-          os.makedirs("calib", exist_ok=True)
-          ds = load_dataset("ag_news", split="train[:200]")
-          for i, ex in enumerate(ds):
-              text = ex["text"].replace("\n"," ")[:1000]
-              with open(f"calib/sample_{i:04d}.txt","w") as f:
-                  f.write(text)
-          print("Calibration files:", len(os.listdir("calib")))
-          PY
+      - name: Optimize model with Hailo DFC
+        run: hailo optimize distilgpt2.har --calib-set-path calib_set.npy --output-har-path distilgpt2_optimized.har
 
-      # --------- Parse → Optimize (best effort) → Compile ----------
-      - name: Parse ONNX → HAR (DFC CLI)
-        id: parsehar
-        continue-on-error: true
-        run: |
-          set -euo pipefail
-          hailo parser onnx onnx/model.onnx --har-path build/parsed.har --hw-arch hailo8
-          ls -lh build/parsed.har
-
-      - name: Optimize (quantize) HAR if possible
-        id: optimize
-        continue-on-error: true
-        run: |
-          set -euo pipefail
-          hailo optimize --har build/parsed.har --calib-set calib --output-har build/optimized.har || true
-          if [ -f build/optimized.har ]; then
-            echo "HAR_OUT=build/optimized.har" >> "$GITHUB_ENV"
-          else
-            echo "HAR_OUT=build/parsed.har" >> "$GITHUB_ENV"
-          fi
-          echo "Using HAR_OUT=$HAR_OUT"
-
-      - name: Compile HEF
-        run: |
-          set -euo pipefail
-          hailo compiler --hef-path reranker.hef "$HAR_OUT"
-          ls -lh reranker.hef
+      - name: Compile model to HEF with Hailo DFC
+        run: hailo compiler distilgpt2_optimized.har --output-dir .
 
       - name: Upload HEF artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v3
         with:
-          name: hailo-hef
-          path: reranker.hef
+          name: distilgpt2-hef
+          path: distilgpt2.hef
