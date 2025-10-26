@@ -1,83 +1,128 @@
-name: Hailo DistilGPT2 Compilation
+name: DistilGPT2-Hailo8-HEF Compilation
 
+# Trigger on push or manual dispatch
 on:
+  push:
   workflow_dispatch:
 
 jobs:
-  compile_model:
+  build-and-compile:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
-
+    env:
+      HF_HOME: /tmp/huggingface  # use temp dir for model download cache (optional)
     steps:
+      # (Optional) Check out repo if needed for scripts or to store ONNX, not strictly required for this pipeline
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v3
 
-      # DFC 3.33.0 pulls jax==0.5.3 → needs Python ≥3.10. Use 3.10 to satisfy wheels.
-      - name: Set up Python 3.10
-        uses: actions/setup-python@v5
+      - name: Set up Python 3.8
+        uses: actions/setup-python@v4
         with:
-          python-version: '3.10'
+          python-version: '3.8'
 
-      # Fix for earlier failure: pygraphviz build needs Graphviz headers and toolchain
-      - name: Install system build deps (graphviz headers, toolchain)
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            graphviz libgraphviz-dev pkg-config build-essential
+      - name: Install system dependencies (Graphviz)
+        run: sudo apt-get update && sudo apt-get install -y graphviz libgraphviz-dev
 
-      - name: Install Python deps (Torch, Transformers, ONNX, NumPy)
+      - name: Install Python dependencies
         run: |
-          python -m pip install --upgrade pip
-          pip install torch==2.0.1 transformers==4.33.0 onnx numpy
+          pip install torch==2.0.1 transformers==4.33.3 onnx==1.14.0 \
+                      jax==0.4.23 onnxruntime==1.15.1
+          # Install Hailo Dataflow Compiler wheel (no-deps to avoid jax 0.5.3 conflict [oai_citation:8‡community.hailo.ai](https://community.hailo.ai/t/dataflow-compiler-3-32-0-fails-in-brand-new-python3-9-virtual-environment/17238#:~:text=ERROR%3A%20Could%20not%20find%20a,64))
+          pip install --no-deps https://github.com/s4mr0cket99m-bit/Hef_builder/releases/download/dfc-1/hailo_dataflow_compiler-3.33.0-py3-none-linux_x86_64.whl
 
-      - name: Download and convert DistilGPT2 to ONNX (seq len 128)
+      - name: Convert DistilGPT2 to ONNX
         run: |
-          python - << 'EOF'
+          python - <<'PYCODE'
           import torch
-          from transformers import AutoModelForCausalLM
-          model = AutoModelForCausalLM.from_pretrained("distilgpt2")
+          from transformers import AutoModelForCausalLM, AutoTokenizer
+          # Load DistilGPT2 model and tokenizer
+          model = AutoModelForCausalLM.from_pretrained("distilgpt2", torch_dtype=torch.float32)
           model.eval()
-          dummy_input = torch.randint(0, 50257, (1, 128), dtype=torch.long)
+          tokenizer = AutoTokenizer.from_pretrained("distilgpt2")
+          # Prepare dummy input of sequence length 128
+          inputs = tokenizer("Hello world", return_tensors='pt', padding='max_length', max_length=128)
+          input_ids = inputs["input_ids"]  # shape (1, 128)
+          attention_mask = inputs["attention_mask"]  # shape (1, 128)
+          # Export to ONNX with fixed input shapes (batch=1, seq=128)
           torch.onnx.export(
-              model,
-              dummy_input,
+              model, 
+              (input_ids, attention_mask), 
               "distilgpt2.onnx",
-              input_names=["input_ids"],
+              input_names=["input_ids", "attention_mask"], 
               output_names=["logits"],
               opset_version=13,
-              dynamic_axes=None
+              do_constant_folding=True
           )
-          EOF
+          print("ONNX model saved as distilgpt2.onnx")
+          PYCODE
 
-      - name: Generate synthetic calibration data
+      - name: Patch ONNX model (fix Gemm transB issue)
         run: |
-          python - << 'EOF'
+          python - <<'PYCODE'
+          import onnx
           import numpy as np
-          calib = np.random.randint(0, 50257, size=(10, 128), dtype=np.int32)
-          np.save("calib_set.npy", calib)
-          EOF
+          from onnx import numpy_helper
+          model = onnx.load("distilgpt2.onnx")
+          graph = model.graph
+          # Map initializer data for quick access
+          init_dict = {init.name: numpy_helper.to_array(init) for init in graph.initializer}
+          new_inits = []
+          for node in graph.node:
+              if node.op_type == "Gemm":
+                  # Check Gemm attributes
+                  transB = 0
+                  transA = 0
+                  for attr in node.attribute:
+                      if attr.name == "transB":
+                          transB = attr.i
+                      if attr.name == "transA":
+                          transA = attr.i
+                  # If weight B is expected to be transposed (transB==1), transpose it upfront
+                  if transB == 1 and len(node.input) > 1:
+                      weight_name = node.input[1]
+                      if weight_name in init_dict:
+                          W = init_dict[weight_name]
+                          WT = np.transpose(W)
+                          new_name = weight_name + "_transposed"
+                          # Replace second input with transposed weight
+                          node.input[1] = new_name
+                          new_inits.append(numpy_helper.from_array(WT, name=new_name))
+                          # Remove transB attribute (no longer needed after transpose)
+                          node.attribute[:] = [attr for attr in node.attribute if attr.name != "transB"]
+                  # Remove transA if it exists (transpose of input tensor, not expected for DistilGPT2)
+                  if transA == 1:
+                      node.attribute[:] = [attr for attr in node.attribute if attr.name != "transA"]
+          # Append new initializers to graph and save the patched model
+          for init in new_inits:
+              graph.initializer.append(init)
+          onnx.save(model, "distilgpt2_fixed.onnx")
+          print("Patched ONNX model saved as distilgpt2_fixed.onnx")
+          PYCODE
 
-      # --- This was failing before on Python 3.8 due to jax==0.5.3 ---
-      - name: Install Hailo Dataflow Compiler 3.33.0
+      - name: Parse ONNX to HAR (Hailo DFC)
         run: |
-          pip install \
-            https://github.com/s4mr0cket99m-bit/Hef_builder/releases/download/dfc-1/hailo_dataflow_compiler-3.33.0-py3-none-linux_x86_64.whl
+          # Use Hailo parser to create HAR from ONNX [oai_citation:9‡community.hailo.ai](https://community.hailo.ai/t/need-help-for-voluntary-project-convert-onnx-to-hef/15703#:~:text=Step%201%3A%20Parse%20ONNX%20to,HAR)
+          hailo parser onnx distilgpt2_fixed.onnx \
+                --net-input-shapes input_ids=1,128 \
+                --hw-arch hailo8
+          ls -lh *.har  # list generated HAR file for verification
 
-      # Parse → Optimize → Compile (target Hailo-8)
-      - name: Parse ONNX to HAR
+      - name: Optimize (quantize) HAR with random calibration
         run: |
-          hailo parser onnx distilgpt2.onnx --hw-arch hailo8 --har-path distilgpt2.har
-
-      - name: Optimize / Quantize with calibration
-        run: |
-          hailo optimize distilgpt2.har --calib-set-path calib_set.npy --output-har-path distilgpt2_optimized.har
+          # Quantize model to int8 with synthetic (random) calibration data
+          # --use-random-calib-set flag generates random inputs [oai_citation:10‡community.hailo.ai](https://community.hailo.ai/t/convert-onxx-to-hef-using-the-cli/9106#:~:text=%24,set)
+          hailo optimize distilgpt2_fixed.har \
+                --use-random-calib-set \
+                --output-har-path distilgpt2_quantized.har \
+                --hw-arch hailo8
+          ls -lh distilgpt2_quantized.har
 
       - name: Compile HAR to HEF
         run: |
-          hailo compile distilgpt2_optimized.har --output-dir .
-          # Ensure predictable name for the artifact:
-          HEF="$(ls -1 *.hef | head -n 1)"
-          mv "$HEF" distilgpt2.hef
+          hailo compiler distilgpt2_quantized.har \
+                --hw-arch hailo8 \
+                --hef-path distilgpt2.hef
+          echo "HEF file size:" && ls -lh distilgpt2.hef
 
       - name: Upload HEF artifact
         uses: actions/upload-artifact@v4
