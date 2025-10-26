@@ -12,12 +12,13 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Set up Python 3.8 (recommended for DFC)
+      # DFC 3.33.0 pulls jax==0.5.3 → needs Python ≥3.10. Use 3.10 to satisfy wheels.
+      - name: Set up Python 3.10
         uses: actions/setup-python@v5
         with:
-          python-version: '3.8'
+          python-version: '3.10'
 
-      # --- Fix for your error: pygraphviz needs Graphviz headers (cgraph.h) ---
+      # Fix for earlier failure: pygraphviz build needs Graphviz headers and toolchain
       - name: Install system build deps (graphviz headers, toolchain)
         run: |
           sudo apt-get update
@@ -43,7 +44,7 @@ jobs:
               "distilgpt2.onnx",
               input_names=["input_ids"],
               output_names=["logits"],
-              opset_version=13,   # stable for most transformer ops
+              opset_version=13,
               dynamic_axes=None
           )
           EOF
@@ -52,17 +53,17 @@ jobs:
         run: |
           python - << 'EOF'
           import numpy as np
-          # 10 samples x 128 tokens; values in [0, 50256]
           calib = np.random.randint(0, 50257, size=(10, 128), dtype=np.int32)
           np.save("calib_set.npy", calib)
           EOF
 
+      # --- This was failing before on Python 3.8 due to jax==0.5.3 ---
       - name: Install Hailo Dataflow Compiler 3.33.0
         run: |
           pip install \
             https://github.com/s4mr0cket99m-bit/Hef_builder/releases/download/dfc-1/hailo_dataflow_compiler-3.33.0-py3-none-linux_x86_64.whl
 
-      # Parse → Optimize → Compile (target: Hailo-8)
+      # Parse → Optimize → Compile (target Hailo-8)
       - name: Parse ONNX to HAR
         run: |
           hailo parser onnx distilgpt2.onnx --hw-arch hailo8 --har-path distilgpt2.har
@@ -74,8 +75,8 @@ jobs:
       - name: Compile HAR to HEF
         run: |
           hailo compile distilgpt2_optimized.har --output-dir .
-          # Ensure predictable name:
-          HEF=$(ls -1 *.hef | head -n 1)
+          # Ensure predictable name for the artifact:
+          HEF="$(ls -1 *.hef | head -n 1)"
           mv "$HEF" distilgpt2.hef
 
       - name: Upload HEF artifact
