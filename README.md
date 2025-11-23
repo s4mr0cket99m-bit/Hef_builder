@@ -48,3 +48,30 @@ jobs:
         with:
           name: distilgpt2-hef   # Artifact name shown in GitHub UI
           path: distilgpt2.hef   # Path of the .hef file to upload
+
+## Antibiotic molecular orbital tensorizer
+
+A lightweight Python module lives in `src/antibiotic_tensorizer.py` that converts
+hand-crafted antibiotic molecular descriptions into tensor grids an LLM can ingest.
+Run the example to export a compressed NumPy bundle:
+
+```bash
+python src/antibiotic_tensorizer.py
+```
+
+The script produces `amoxicillin_tensor_example.npz` containing atom positions,
+feature vectors, functional-group masks, approximate orbital grids, and an electron
+density grid for a mock amoxicillin-like molecule.
+
+To build tensors for a broad library of approved antibiotics grouped by mechanism
+of action—and to emit averaged matrices per mechanism—run:
+
+```bash
+python src/antibiotic_tensorizer.py
+ls antibiotic_tensor_matrices
+```
+
+This writes one compressed NumPy archive per antibiotic (named after the
+antibiotic, such as `vancomycin.npz` or `ciprofloxacin.npz`) plus
+`<mechanism>_average.npz` files that contain mechanism-level averaged tensors,
+all under `antibiotic_tensor_matrices/` for easy LLM ingestion.
